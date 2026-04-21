@@ -1,10 +1,12 @@
 import os
-from flask import Flask, jsonify, send_file
+import base64
+import math
+import io
+
+from flask import Flask, jsonify
 from PIL import Image
 import numpy as np
 import requests
-import io
-import math
 
 app = Flask(__name__)
 
@@ -28,7 +30,6 @@ def decode_terrain_rgb(img, resolution=64):
     img = img.resize((resolution, resolution)).convert("RGB")
     pixels = np.array(img, dtype=np.float32)
     R, G, B = pixels[:,:,0], pixels[:,:,1], pixels[:,:,2]
-    # Real world heights in meters
     heights = -10000 + ((R * 65536 + G * 256 + B) * 0.1)
     return heights.tolist()
 
@@ -53,7 +54,8 @@ def get_satellite(lat, lon, zoom):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
-    return send_file(buf, mimetype="image/png")
+    encoded = base64.b64encode(buf.read()).decode("utf-8")
+    return jsonify({"image_base64": encoded})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

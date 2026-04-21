@@ -18,7 +18,7 @@ def lat_lon_to_tile(lat, lon, zoom):
     return x, y
 
 def fetch_tile(tileset, z, x, y):
-    url = f"https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.pngraw?access_token={MAPBOX_TOKEN}"
+    url = f"https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.png?access_token={MAPBOX_TOKEN}"
     r = requests.get(url)
     if r.status_code != 200:
         raise Exception(f"Mapbox error {r.status_code}: {r.text}")

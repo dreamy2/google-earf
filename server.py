@@ -4,10 +4,11 @@ import numpy as np
 import requests
 import io
 import math
+import os
 
 app = Flask(__name__)
 
-MAPBOX_TOKEN = "PASTE_YOUR_MAPBOX_TOKEN_HERE"
+MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)

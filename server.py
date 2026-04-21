@@ -1,10 +1,10 @@
+import os
 from flask import Flask, jsonify, send_file
 from PIL import Image
 import numpy as np
 import requests
 import io
 import math
-import os
 
 app = Flask(__name__)
 
@@ -28,12 +28,9 @@ def decode_terrain_rgb(img, resolution=64):
     img = img.resize((resolution, resolution)).convert("RGB")
     pixels = np.array(img, dtype=np.float32)
     R, G, B = pixels[:,:,0], pixels[:,:,1], pixels[:,:,2]
+    # Real world heights in meters
     heights = -10000 + ((R * 65536 + G * 256 + B) * 0.1)
-    h_min, h_max = heights.min(), heights.max()
-    if h_max == h_min:
-        return np.zeros((resolution, resolution)).tolist()
-    normalized = (heights - h_min) / (h_max - h_min) * 500
-    return normalized.tolist()
+    return heights.tolist()
 
 @app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_terrain(lat, lon, zoom):
@@ -47,8 +44,9 @@ def get_terrain(lat, lon, zoom):
         "tile": {"z": zoom, "x": x, "y": y}
     })
 
-@app.route('/terrain/<lat>/<lon>/<zoom>')
+@app.route('/satellite/<lat>/<lon>/<zoom>')
 def get_satellite(lat, lon, zoom):
+    lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_tile("mapbox.satellite", zoom, x, y)
     img = img.resize((256, 256)).convert("RGB")

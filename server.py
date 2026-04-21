@@ -33,8 +33,9 @@ def decode_terrain_rgb(img, resolution=64):
     normalized = (heights - h_min) / (h_max - h_min) * 500
     return normalized.tolist()
 
-@app.route('/terrain/<float:lat>/<float:lon>/<int:zoom>')
+@app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_terrain(lat, lon, zoom):
+    lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_tile("mapbox.terrain-rgb", zoom, x, y)
     heights = decode_terrain_rgb(img, resolution=64)
@@ -44,7 +45,7 @@ def get_terrain(lat, lon, zoom):
         "tile": {"z": zoom, "x": x, "y": y}
     })
 
-@app.route('/satellite/<float:lat>/<float:lon>/<int:zoom>')
+@app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_satellite(lat, lon, zoom):
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_tile("mapbox.satellite", zoom, x, y)

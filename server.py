@@ -50,11 +50,10 @@ def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_tile("mapbox.satellite", zoom, x, y)
-    # resize to 128x128 (manageable payload, good quality)
-    img = img.resize((128, 128)).convert("RGBA")
-    pixels = np.array(img, dtype=np.float32) / 255.0
-    # flatten to [r,g,b,a, r,g,b,a, ...] — what roblox WritePixels expects
-    return jsonify({"pixels": pixels.flatten().tolist(), "size": 128})
+    img = img.resize((256, 256)).convert("RGBA")
+    # flat list of r,g,b,a integers 0-255
+    flat = [v for px in img.getdata() for v in px]
+    return jsonify({"pixels": flat, "size": 256})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

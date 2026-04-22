@@ -3,3 +3,4 @@ pillow
 numpy
 requests
 scipy
+gunicorn

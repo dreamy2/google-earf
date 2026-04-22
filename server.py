@@ -6,14 +6,23 @@ from flask import Flask, jsonify
 from PIL import Image
 import numpy as np
 import requests
-from scipy.ndimage import median_filter, sobel
+from scipy.ndimage import median_filter, sobel, gaussian_filter
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024
 TERRAIN_RES = 128
-NORMAL_STRENGTH = 3.0  # higher = more dramatic slope lighting
+NORMAL_STRENGTH = 1.5
+NORMAL_SMOOTH_SIGMA = 2.0  # higher = softer pbr lighting, kills urban noise
+
+# shared thread pool so mapbox tile fetches run in parallel
+# 16 workers handles 4x4 satellite grid + 2x2 terrain grid comfortably
+tile_pool = ThreadPoolExecutor(max_workers=16)
+
+# shared session reuses tcp connections -> way faster than per-request requests.get
+http_session = requests.Session()
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -24,23 +33,30 @@ def lat_lon_to_tile(lat, lon, zoom):
 
 def fetch_tile(tileset, z, x, y):
     url = f"https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.png?access_token={MAPBOX_TOKEN}"
-    r = requests.get(url)
+    r = http_session.get(url, timeout=10)
     if r.status_code != 200:
         raise Exception(f"Mapbox error {r.status_code}: {r.text}")
     return Image.open(io.BytesIO(r.content))
 
+def fetch_tiles_parallel(tileset, zoom, base_x, base_y, grid):
+    # fetch all tiles at once instead of one-by-one, huge speedup
+    jobs = []
+    for row in range(grid):
+        for col in range(grid):
+            jobs.append((row, col, tile_pool.submit(fetch_tile, tileset, zoom, base_x + col, base_y + row)))
+    return [(row, col, f.result()) for (row, col, f) in jobs]
+
 def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
-    # grabs higher zoom tiles over the same area for real extra detail
+    # higher zoom gives real extra detail for the same area
     zoom_offset = int(math.log2(SATELLITE_RES // 256))
     grid = 2 ** zoom_offset
     sat_zoom = terrain_zoom + zoom_offset
     x = terrain_x * grid
     y = terrain_y * grid
+
     stitched = Image.new("RGB", (grid * 256, grid * 256))
-    for row in range(grid):
-        for col in range(grid):
-            tile = fetch_tile("mapbox.satellite", sat_zoom, x + col, y + row)
-            stitched.paste(tile, (col * 256, row * 256))
+    for row, col, tile in fetch_tiles_parallel("mapbox.satellite", sat_zoom, x, y, grid):
+        stitched.paste(tile, (col * 256, row * 256))
     return stitched
 
 def decode_terrain_rgb(img):
@@ -57,12 +73,11 @@ def fetch_and_stitch_terrain(zoom, x, y):
     ty = y * grid
     tile_size = 64
     stitched = np.zeros((grid * tile_size, grid * tile_size), dtype=np.float32)
-    for row in range(grid):
-        for col in range(grid):
-            tile = fetch_tile("mapbox.terrain-rgb", sat_zoom, tx + col, ty + row)
-            tile = tile.resize((tile_size, tile_size))
-            h = decode_terrain_rgb(tile)
-            stitched[row*tile_size:(row+1)*tile_size, col*tile_size:(col+1)*tile_size] = h
+
+    for row, col, tile in fetch_tiles_parallel("mapbox.terrain-rgb", sat_zoom, tx, ty, grid):
+        tile = tile.resize((tile_size, tile_size))
+        h = decode_terrain_rgb(tile)
+        stitched[row*tile_size:(row+1)*tile_size, col*tile_size:(col+1)*tile_size] = h
     return stitched
 
 def smooth_heights(heights, passes=3):
@@ -83,7 +98,7 @@ def generate_normal_map(heights, size):
     ny = -gy / length
     nz = nz / length
 
-    # pack normal vectors into rgba 0-255 (tangent space convention)
+    # pack into rgba 0-255, tangent space convention
     rgba = np.stack([
         ((nx * 0.5) + 0.5) * 255,
         ((ny * 0.5) + 0.5) * 255,
@@ -92,7 +107,8 @@ def generate_normal_map(heights, size):
     ], axis=-1).astype(np.uint8)
 
     img = Image.fromarray(rgba, mode="RGBA").resize((size, size), Image.BILINEAR)
-    return [v for px in img.getdata() for v in px]
+    # tobytes + list is ~3x faster than nested list comp
+    return list(img.tobytes())
 
 @app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_terrain(lat, lon, zoom):
@@ -101,8 +117,10 @@ def get_terrain(lat, lon, zoom):
     heights = fetch_and_stitch_terrain(zoom, x, y)
     heights = smooth_heights(heights, passes=3)
 
-    # generate normal map at full satellite res so it aligns with the color map
-    normal_pixels = generate_normal_map(heights, SATELLITE_RES)
+    # extra gaussian blur just for normal generation, keeps mesh sharp
+    # but makes urban areas lit gently instead of splotchy
+    heights_for_normals = gaussian_filter(heights, sigma=NORMAL_SMOOTH_SIGMA)
+    normal_pixels = generate_normal_map(heights_for_normals, SATELLITE_RES)
 
     # downsample heights for mesh vertices
     h_img = Image.fromarray(heights)
@@ -124,9 +142,10 @@ def get_satellite(lat, lon, zoom):
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_and_stitch_satellite(zoom, x, y)
     img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
-    flat = [v for px in img.getdata() for v in px]
+    # tobytes + list is ~3x faster than flattening via generator
+    flat = list(img.tobytes())
     return jsonify({"pixels": flat, "size": SATELLITE_RES})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)

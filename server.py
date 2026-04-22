@@ -7,12 +7,13 @@ from flask import Flask, jsonify
 from PIL import Image
 import numpy as np
 import requests
+from scipy.ndimage import uniform_filter
 
 app = Flask(__name__)
 
-SATELLITE_RES = 1024
-
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
+SATELLITE_RES = 1024  # 256, 512, 1024, 2048
+TERRAIN_RES = 128     # increase for more terrain detail
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -28,27 +29,7 @@ def fetch_tile(tileset, z, x, y):
         raise Exception(f"Mapbox error {r.status_code}: {r.text}")
     return Image.open(io.BytesIO(r.content))
 
-def decode_terrain_rgb(img, resolution=64):
-    img = img.resize((resolution, resolution)).convert("RGB")
-    pixels = np.array(img, dtype=np.float32)
-    R, G, B = pixels[:,:,0], pixels[:,:,1], pixels[:,:,2]
-    heights = -10000 + ((R * 65536 + G * 256 + B) * 0.1)
-    return heights.tolist()
-
-@app.route('/terrain/<lat>/<lon>/<zoom>')
-def get_terrain(lat, lon, zoom):
-    lat, lon, zoom = float(lat), float(lon), int(zoom)
-    x, y = lat_lon_to_tile(lat, lon, zoom)
-    img = fetch_tile("mapbox.terrain-rgb", zoom, x, y)
-    heights = decode_terrain_rgb(img, resolution=64)
-    return jsonify({
-        "heights": heights,
-        "size": 64,
-        "tile": {"z": zoom, "x": x, "y": y}
-    })
-
-def fetch_and_stitch(tileset, terrain_zoom, terrain_x, terrain_y):
-    # derive zoom offset and grid size from SATELLITE_RES
+def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
     zoom_offset = int(math.log2(SATELLITE_RES // 256))
     grid = 2 ** zoom_offset
     sat_zoom = terrain_zoom + zoom_offset
@@ -57,15 +38,57 @@ def fetch_and_stitch(tileset, terrain_zoom, terrain_x, terrain_y):
     stitched = Image.new("RGB", (grid * 256, grid * 256))
     for row in range(grid):
         for col in range(grid):
-            tile = fetch_tile(tileset, sat_zoom, x + col, y + row)
+            tile = fetch_tile("mapbox.satellite", sat_zoom, x + col, y + row)
             stitched.paste(tile, (col * 256, row * 256))
     return stitched
+
+def decode_terrain_rgb(img):
+    img = img.convert("RGB")
+    pixels = np.array(img, dtype=np.float32)
+    R, G, B = pixels[:,:,0], pixels[:,:,1], pixels[:,:,2]
+    return -10000 + ((R * 65536 + G * 256 + B) * 0.1)
+
+def fetch_and_stitch_terrain(zoom, x, y):
+    zoom_offset = int(math.log2(max(TERRAIN_RES // 64, 1)))
+    grid = 2 ** zoom_offset
+    sat_zoom = zoom + zoom_offset
+    tx = x * grid
+    ty = y * grid
+    tile_size = 64
+    stitched = np.zeros((grid * tile_size, grid * tile_size), dtype=np.float32)
+    for row in range(grid):
+        for col in range(grid):
+            tile = fetch_tile("mapbox.terrain-rgb", sat_zoom, tx + col, ty + row)
+            tile = tile.resize((tile_size, tile_size))
+            h = decode_terrain_rgb(tile)
+            stitched[row*tile_size:(row+1)*tile_size, col*tile_size:(col+1)*tile_size] = h
+    return stitched
+
+def smooth_heights(heights, passes=3):
+    for _ in range(passes):
+        heights = uniform_filter(heights, size=3)
+    return heights
+
+@app.route('/terrain/<lat>/<lon>/<zoom>')
+def get_terrain(lat, lon, zoom):
+    lat, lon, zoom = float(lat), float(lon), int(zoom)
+    x, y = lat_lon_to_tile(lat, lon, zoom)
+    heights = fetch_and_stitch_terrain(zoom, x, y)
+    heights = smooth_heights(heights, passes=3)
+    # resize to terrain res
+    h_img = Image.fromarray(heights)
+    h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
+    heights = np.array(h_img)
+    return jsonify({
+        "heights": heights.tolist(),
+        "size": TERRAIN_RES,
+    })
 
 @app.route('/satellite/<lat>/<lon>/<zoom>')
 def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
-    img = fetch_and_stitch("mapbox.satellite", zoom, x, y)
+    img = fetch_and_stitch_satellite(zoom, x, y)
     img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
     flat = [v for px in img.getdata() for v in px]
     return jsonify({"pixels": flat, "size": SATELLITE_RES})

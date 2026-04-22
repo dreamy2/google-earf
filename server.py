@@ -18,12 +18,12 @@ SATELLITE_RES = 1024
 TERRAIN_RES = 128
 POI_SIZERANK_MAX = 8
 
-# small pool so we dont blow railway memory with too many concurrent images
+# small pool so we dont blow railway memory
 tile_pool = ThreadPoolExecutor(max_workers=4)
 http_session = requests.Session()
 
-# reuse raw tile bytes across requests for adjacent tiles
-# small cache size keeps memory predictable (256 tiles ~= 25mb)
+# cache raw tile bytes so neighbor tiles reuse each others fetches
+# 256 tiles ~= 25mb, safe for railway free tier
 @lru_cache(maxsize=256)
 def _cached_tile_bytes(url):
     r = http_session.get(url, timeout=10)
@@ -43,7 +43,6 @@ def lat_lon_to_tile(lat, lon, zoom):
     return x, y
 
 def fetch_tiles_parallel(tileset, zoom, base_x, base_y, grid):
-    # submit raw-bytes fetches, then open and paste one at a time
     jobs = []
     for row in range(grid):
         for col in range(grid):
@@ -51,6 +50,7 @@ def fetch_tiles_parallel(tileset, zoom, base_x, base_y, grid):
     return jobs
 
 def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
+    # higher zoom tiles give real extra detail for the same area
     zoom_offset = int(math.log2(SATELLITE_RES // 256))
     grid = 2 ** zoom_offset
     sat_zoom = terrain_zoom + zoom_offset
@@ -71,8 +71,7 @@ def decode_terrain_rgb(img):
     return -10000 + ((R * 65536 + G * 256 + B) * 0.1)
 
 def fetch_terrain_grid(zoom, x, y):
-    # fetches the native 64x64 heightmap for a single mapbox tile at the target zoom
-    # simpler than the old stitch - one tile per call, fast to cache
+    # fetches a single mapbox tile's heightmap at the target zoom
     zoom_offset = int(math.log2(max(TERRAIN_RES // 64, 1)))
     sat_zoom = zoom + zoom_offset
     grid = 2 ** zoom_offset
@@ -89,6 +88,7 @@ def fetch_terrain_grid(zoom, x, y):
     return stitched
 
 def smooth_heights(heights, passes=3):
+    # median filter kills building/noise spikes without flattening real hills
     for _ in range(passes):
         heights = median_filter(heights, size=5)
     return heights
@@ -113,44 +113,16 @@ def get_terrain(lat, lon, zoom):
     try:
         lat, lon, zoom = float(lat), float(lon), int(zoom)
         x, y = lat_lon_to_tile(lat, lon, zoom)
+        heights = fetch_terrain_grid(zoom, x, y)
+        heights = smooth_heights(heights, passes=3)
 
-        # fetch the 4 tiles we need in parallel: center, east, south, se corner
-        # the neighbor tiles are cached so follow-up calls reuse them
-        futs = {
-            "c":  tile_pool.submit(fetch_terrain_grid, zoom, x,     y),
-            "e":  tile_pool.submit(fetch_terrain_grid, zoom, x + 1, y),
-            "s":  tile_pool.submit(fetch_terrain_grid, zoom, x,     y + 1),
-            "se": tile_pool.submit(fetch_terrain_grid, zoom, x + 1, y + 1),
-        }
-        hc = futs["c"].result()
-        he = futs["e"].result()
-        hs = futs["s"].result()
-        hse = futs["se"].result()
-
-        # stitch a (h+1) x (w+1) grid so shared edges come from the SAME source pixels
-        # this is the fix for tile seams - both neighbors use the same edge data
-        h, w = hc.shape
-        overlap = np.empty((h + 1, w + 1), dtype=np.float32)
-        overlap[:h, :w] = hc
-        overlap[:h, w]  = he[:h, 0]
-        overlap[h, :w]  = hs[0, :w]
-        overlap[h, w]   = hse[0, 0]
-
-        # smooth only the interior - edges must stay pristine for neighbor alignment
-        interior = smooth_heights(overlap[1:-1, 1:-1], passes=3)
-        overlap[1:-1, 1:-1] = interior
-
-        # resize to TERRAIN_RES + 1 so the shared edge row/col survive
-        out_size = TERRAIN_RES + 1
-        h_img = Image.fromarray(overlap)
-        h_img = h_img.resize((out_size, out_size), Image.BILINEAR)
+        # float32 needs explicit mode F for PIL
+        h_img = Image.fromarray(heights.astype(np.float32), mode='F')
+        h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
         heights = np.asarray(h_img)
 
-        result = {
-            "heights": heights.tolist(),
-            "size": out_size,
-        }
-        del h_img, overlap, hc, he, hs, hse, interior
+        result = {"heights": heights.tolist(), "size": TERRAIN_RES}
+        del h_img
         gc.collect()
         return jsonify(result)
     except Exception as e:
@@ -164,7 +136,6 @@ def get_satellite(lat, lon, zoom):
         x, y = lat_lon_to_tile(lat, lon, zoom)
         img = fetch_and_stitch_satellite(zoom, x, y)
         img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
-        # tobytes + list is ~3x faster than a generator comp
         flat = list(img.tobytes())
         img.close()
         del img
@@ -181,7 +152,7 @@ def get_pois(lat, lon, zoom):
         n = 2 ** zoom
         tile_deg = 360 / n
 
-        # 3x3 grid of tilequeries covers a zoom-12 tile well
+        # 3x3 grid of tilequeries covers a zoom-12 tile
         jobs = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):

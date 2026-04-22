@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024  # 256, 512, 1024, 2048
-TERRAIN_RES = 128     # increase for more terrain detail
+TERRAIN_RES = 256     # increase for more terrain detail
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -74,14 +74,15 @@ def get_terrain(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     heights = fetch_and_stitch_terrain(zoom, x, y)
-    heights = smooth_heights(heights, passes=3)
-    # resize to terrain res
+    heights = smooth_heights(heights, passes=4)
     h_img = Image.fromarray(heights)
     h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
     heights = np.array(h_img)
     return jsonify({
         "heights": heights.tolist(),
         "size": TERRAIN_RES,
+        "min_height": float(heights.min()),
+        "max_height": float(heights.max()),
     })
 
 @app.route('/satellite/<lat>/<lon>/<zoom>')

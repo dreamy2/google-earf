@@ -12,7 +12,7 @@ from scipy.ndimage import median_filter
 app = Flask(__name__)
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
-SATELLITE_RES = 1024  # 256, 512, 1024, 2048
+SATELLITE_RES = 2048  # 256, 512, 1024, 2048
 TERRAIN_RES = 128     # increase for more terrain detail
 
 def lat_lon_to_tile(lat, lon, zoom):

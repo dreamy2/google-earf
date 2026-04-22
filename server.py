@@ -16,7 +16,7 @@ app = Flask(__name__)
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024
 TERRAIN_RES = 128
-POI_SIZERANK_MAX = 16  # was 8, now keeps everything labeled down to smallest tier
+POI_SIZERANK_MAX = 10  # 1-16 scale, lower = more prominent; 10 keeps major + significant only
 
 # small pool so we dont blow railway memory
 tile_pool = ThreadPoolExecutor(max_workers=4)
@@ -217,6 +217,15 @@ def get_pois(lat, lon, zoom):
                     "category": category,
                     "sizerank": sizerank,
                 })
+
+        # dedup by name — creeks/rivers get labeled at many points, same name
+        # keep the best-ranked (lowest sizerank) instance per name
+        best_by_name = {}
+        for p in pois:
+            existing = best_by_name.get(p["name"])
+            if existing is None or p["sizerank"] < existing["sizerank"]:
+                best_by_name[p["name"]] = p
+        pois = list(best_by_name.values())
 
         pois.sort(key=lambda p: p["sizerank"])
         return jsonify({"pois": pois})

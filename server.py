@@ -65,7 +65,7 @@ def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_and_stitch("mapbox.satellite", zoom, x, y)
-    img = img.convert("RGBA")
+    img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
     flat = [v for px in img.getdata() for v in px]
     return jsonify({"pixels": flat, "size": SATELLITE_RES})
 

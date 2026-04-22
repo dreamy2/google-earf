@@ -47,17 +47,16 @@ def get_terrain(lat, lon, zoom):
         "tile": {"z": zoom, "x": x, "y": y}
     })
 
-def fetch_and_stitch(tileset, zoom, x, y):
-    # fetch 2x2 neighboring tiles and stitch into one image
-    tiles = [
-        [fetch_tile(tileset, zoom, x,     y),     fetch_tile(tileset, zoom, x + 1, y)],
-        [fetch_tile(tileset, zoom, x,     y + 1), fetch_tile(tileset, zoom, x + 1, y + 1)],
-    ]
+def fetch_and_stitch(tileset, terrain_zoom, terrain_x, terrain_y):
+    # zoom+1 child tiles cover the exact same area as one terrain tile, but 2x more detail
+    sat_zoom = terrain_zoom + 1
+    x = terrain_x * 2
+    y = terrain_y * 2
     stitched = Image.new("RGB", (512, 512))
-    stitched.paste(tiles[0][0], (0,   0))
-    stitched.paste(tiles[0][1], (256, 0))
-    stitched.paste(tiles[1][0], (0,   256))
-    stitched.paste(tiles[1][1], (256, 256))
+    stitched.paste(fetch_tile(tileset, sat_zoom, x,     y),     (0,   0))
+    stitched.paste(fetch_tile(tileset, sat_zoom, x + 1, y),     (256, 0))
+    stitched.paste(fetch_tile(tileset, sat_zoom, x,     y + 1), (0,   256))
+    stitched.paste(fetch_tile(tileset, sat_zoom, x + 1, y + 1), (256, 256))
     return stitched
 
 @app.route('/satellite/<lat>/<lon>/<zoom>')

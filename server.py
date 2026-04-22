@@ -10,7 +10,7 @@ import requests
 
 app = Flask(__name__)
 
-SATELLITE_RES = 512
+SATELLITE_RES = 1024
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
@@ -48,13 +48,15 @@ def get_terrain(lat, lon, zoom):
     })
 
 def fetch_and_stitch(tileset, terrain_zoom, terrain_x, terrain_y):
-    # zoom+2 = same area, 4x more detail
-    sat_zoom = terrain_zoom + 2
-    x = terrain_x * 4
-    y = terrain_y * 4
-    stitched = Image.new("RGB", (1024, 1024))
-    for row in range(4):
-        for col in range(4):
+    # derive zoom offset and grid size from SATELLITE_RES
+    zoom_offset = int(math.log2(SATELLITE_RES // 256))
+    grid = 2 ** zoom_offset
+    sat_zoom = terrain_zoom + zoom_offset
+    x = terrain_x * grid
+    y = terrain_y * grid
+    stitched = Image.new("RGB", (grid * 256, grid * 256))
+    for row in range(grid):
+        for col in range(grid):
             tile = fetch_tile(tileset, sat_zoom, x + col, y + row)
             stitched.paste(tile, (col * 256, row * 256))
     return stitched

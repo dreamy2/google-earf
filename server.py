@@ -7,13 +7,13 @@ from flask import Flask, jsonify
 from PIL import Image
 import numpy as np
 import requests
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import median_filter
 
 app = Flask(__name__)
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024  # 256, 512, 1024, 2048
-TERRAIN_RES = 256     # increase for more terrain detail
+TERRAIN_RES = 128     # increase for more terrain detail
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -66,7 +66,7 @@ def fetch_and_stitch_terrain(zoom, x, y):
 
 def smooth_heights(heights, passes=3):
     for _ in range(passes):
-        heights = uniform_filter(heights, size=3)
+        heights = median_filter(heights, size=5)
     return heights
 
 @app.route('/terrain/<lat>/<lon>/<zoom>')

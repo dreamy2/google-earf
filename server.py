@@ -1,6 +1,7 @@
 import os
 import math
 import io
+import gc
 
 from flask import Flask, jsonify
 from PIL import Image
@@ -8,7 +9,7 @@ import numpy as np
 import requests
 from scipy.ndimage import median_filter
 from concurrent.futures import ThreadPoolExecutor
-import gc
+from functools import lru_cache
 
 app = Flask(__name__)
 
@@ -17,9 +18,22 @@ SATELLITE_RES = 1024
 TERRAIN_RES = 128
 POI_SIZERANK_MAX = 8
 
-# smaller pool to limit peak memory usage
+# small pool so we dont blow railway memory with too many concurrent images
 tile_pool = ThreadPoolExecutor(max_workers=4)
 http_session = requests.Session()
+
+# reuse raw tile bytes across requests for adjacent tiles
+# small cache size keeps memory predictable (256 tiles ~= 25mb)
+@lru_cache(maxsize=256)
+def _cached_tile_bytes(url):
+    r = http_session.get(url, timeout=10)
+    if r.status_code != 200:
+        raise Exception(f"Mapbox error {r.status_code}")
+    return r.content
+
+def fetch_tile_bytes(tileset, z, x, y):
+    url = f"https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.png?access_token={MAPBOX_TOKEN}"
+    return _cached_tile_bytes(url)
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -28,13 +42,13 @@ def lat_lon_to_tile(lat, lon, zoom):
     y = int((1 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n)
     return x, y
 
-def fetch_tile_bytes(tileset, z, x, y):
-    # returns raw bytes, caller decodes when needed (lets us release memory fast)
-    url = f"https://api.mapbox.com/v4/{tileset}/{z}/{x}/{y}.png?access_token={MAPBOX_TOKEN}"
-    r = http_session.get(url, timeout=10)
-    if r.status_code != 200:
-        raise Exception(f"Mapbox error {r.status_code}")
-    return r.content
+def fetch_tiles_parallel(tileset, zoom, base_x, base_y, grid):
+    # submit raw-bytes fetches, then open and paste one at a time
+    jobs = []
+    for row in range(grid):
+        for col in range(grid):
+            jobs.append((row, col, tile_pool.submit(fetch_tile_bytes, tileset, zoom, base_x + col, base_y + row)))
+    return jobs
 
 def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
     zoom_offset = int(math.log2(SATELLITE_RES // 256))
@@ -43,48 +57,35 @@ def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
     x = terrain_x * grid
     y = terrain_y * grid
 
-    # submit all fetches as bytes-only (lightweight, no PIL open yet)
-    jobs = []
-    for row in range(grid):
-        for col in range(grid):
-            jobs.append((row, col, tile_pool.submit(fetch_tile_bytes, "mapbox.satellite", sat_zoom, x + col, y + row)))
-
+    jobs = fetch_tiles_parallel("mapbox.satellite", sat_zoom, x, y, grid)
     stitched = Image.new("RGB", (grid * 256, grid * 256))
     for (row, col, fut) in jobs:
-        tile_bytes = fut.result()
-        # open, paste, close immediately so memory doesnt accumulate
-        with Image.open(io.BytesIO(tile_bytes)) as tile:
+        with Image.open(io.BytesIO(fut.result())) as tile:
             stitched.paste(tile, (col * 256, row * 256))
-        del tile_bytes
     return stitched
 
 def decode_terrain_rgb(img):
     img = img.convert("RGB")
-    pixels = np.array(img, dtype=np.float32)
+    pixels = np.asarray(img, dtype=np.float32)
     R, G, B = pixels[:,:,0], pixels[:,:,1], pixels[:,:,2]
     return -10000 + ((R * 65536 + G * 256 + B) * 0.1)
 
-def fetch_and_stitch_terrain(zoom, x, y):
+def fetch_terrain_grid(zoom, x, y):
+    # fetches the native 64x64 heightmap for a single mapbox tile at the target zoom
+    # simpler than the old stitch - one tile per call, fast to cache
     zoom_offset = int(math.log2(max(TERRAIN_RES // 64, 1)))
-    grid = 2 ** zoom_offset
     sat_zoom = zoom + zoom_offset
+    grid = 2 ** zoom_offset
     tx = x * grid
     ty = y * grid
     tile_size = 64
+
+    jobs = fetch_tiles_parallel("mapbox.terrain-rgb", sat_zoom, tx, ty, grid)
     stitched = np.zeros((grid * tile_size, grid * tile_size), dtype=np.float32)
-
-    jobs = []
-    for row in range(grid):
-        for col in range(grid):
-            jobs.append((row, col, tile_pool.submit(fetch_tile_bytes, "mapbox.terrain-rgb", sat_zoom, tx + col, ty + row)))
-
     for (row, col, fut) in jobs:
-        tile_bytes = fut.result()
-        with Image.open(io.BytesIO(tile_bytes)) as tile:
+        with Image.open(io.BytesIO(fut.result())) as tile:
             tile = tile.resize((tile_size, tile_size))
-            h = decode_terrain_rgb(tile)
-        stitched[row*tile_size:(row+1)*tile_size, col*tile_size:(col+1)*tile_size] = h
-        del tile_bytes
+            stitched[row*tile_size:(row+1)*tile_size, col*tile_size:(col+1)*tile_size] = decode_terrain_rgb(tile)
     return stitched
 
 def smooth_heights(heights, passes=3):
@@ -112,17 +113,44 @@ def get_terrain(lat, lon, zoom):
     try:
         lat, lon, zoom = float(lat), float(lon), int(zoom)
         x, y = lat_lon_to_tile(lat, lon, zoom)
-        heights = fetch_and_stitch_terrain(zoom, x, y)
-        heights = smooth_heights(heights, passes=3)
-        h_img = Image.fromarray(heights)
-        h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
-        heights = np.array(h_img)
+
+        # fetch the 4 tiles we need in parallel: center, east, south, se corner
+        # the neighbor tiles are cached so follow-up calls reuse them
+        futs = {
+            "c":  tile_pool.submit(fetch_terrain_grid, zoom, x,     y),
+            "e":  tile_pool.submit(fetch_terrain_grid, zoom, x + 1, y),
+            "s":  tile_pool.submit(fetch_terrain_grid, zoom, x,     y + 1),
+            "se": tile_pool.submit(fetch_terrain_grid, zoom, x + 1, y + 1),
+        }
+        hc = futs["c"].result()
+        he = futs["e"].result()
+        hs = futs["s"].result()
+        hse = futs["se"].result()
+
+        # stitch a (h+1) x (w+1) grid so shared edges come from the SAME source pixels
+        # this is the fix for tile seams - both neighbors use the same edge data
+        h, w = hc.shape
+        overlap = np.empty((h + 1, w + 1), dtype=np.float32)
+        overlap[:h, :w] = hc
+        overlap[:h, w]  = he[:h, 0]
+        overlap[h, :w]  = hs[0, :w]
+        overlap[h, w]   = hse[0, 0]
+
+        # smooth only the interior - edges must stay pristine for neighbor alignment
+        interior = smooth_heights(overlap[1:-1, 1:-1], passes=3)
+        overlap[1:-1, 1:-1] = interior
+
+        # resize to TERRAIN_RES + 1 so the shared edge row/col survive
+        out_size = TERRAIN_RES + 1
+        h_img = Image.fromarray(overlap)
+        h_img = h_img.resize((out_size, out_size), Image.BILINEAR)
+        heights = np.asarray(h_img)
+
         result = {
             "heights": heights.tolist(),
-            "size": TERRAIN_RES,
+            "size": out_size,
         }
-        # force memory release before returning response
-        del h_img
+        del h_img, overlap, hc, he, hs, hse, interior
         gc.collect()
         return jsonify(result)
     except Exception as e:
@@ -136,6 +164,7 @@ def get_satellite(lat, lon, zoom):
         x, y = lat_lon_to_tile(lat, lon, zoom)
         img = fetch_and_stitch_satellite(zoom, x, y)
         img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
+        # tobytes + list is ~3x faster than a generator comp
         flat = list(img.tobytes())
         img.close()
         del img
@@ -152,6 +181,7 @@ def get_pois(lat, lon, zoom):
         n = 2 ** zoom
         tile_deg = 360 / n
 
+        # 3x3 grid of tilequeries covers a zoom-12 tile well
         jobs = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):

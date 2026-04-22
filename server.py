@@ -47,12 +47,25 @@ def get_terrain(lat, lon, zoom):
         "tile": {"z": zoom, "x": x, "y": y}
     })
 
+def fetch_and_stitch(tileset, zoom, x, y):
+    # fetch 2x2 neighboring tiles and stitch into one image
+    tiles = [
+        [fetch_tile(tileset, zoom, x,     y),     fetch_tile(tileset, zoom, x + 1, y)],
+        [fetch_tile(tileset, zoom, x,     y + 1), fetch_tile(tileset, zoom, x + 1, y + 1)],
+    ]
+    stitched = Image.new("RGB", (512, 512))
+    stitched.paste(tiles[0][0], (0,   0))
+    stitched.paste(tiles[0][1], (256, 0))
+    stitched.paste(tiles[1][0], (0,   256))
+    stitched.paste(tiles[1][1], (256, 256))
+    return stitched
+
 @app.route('/satellite/<lat>/<lon>/<zoom>')
 def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
-    img = fetch_tile("mapbox.satellite", zoom, x, y)
-    img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
+    img = fetch_and_stitch("mapbox.satellite", zoom, x, y)
+    img = img.convert("RGBA")
     flat = [v for px in img.getdata() for v in px]
     return jsonify({"pixels": flat, "size": SATELLITE_RES})
 

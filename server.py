@@ -16,7 +16,7 @@ app = Flask(__name__)
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024
 TERRAIN_RES = 128
-POI_SIZERANK_MAX = 8
+POI_SIZERANK_MAX = 16  # was 8, now keeps everything labeled down to smallest tier
 
 # small pool so we dont blow railway memory
 tile_pool = ThreadPoolExecutor(max_workers=4)
@@ -41,6 +41,13 @@ def lat_lon_to_tile(lat, lon, zoom):
     x = int((lon + 180) / 360 * n)
     y = int((1 - math.log(math.tan(lat_r) + 1 / math.cos(lat_r)) / math.pi) / 2 * n)
     return x, y
+
+def tile_to_lat_lon(x, y, zoom):
+    # inverse of lat_lon_to_tile, returns top-left corner of the tile
+    n = 2 ** zoom
+    lon = x / n * 360 - 180
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    return lat, lon
 
 def fetch_tiles_parallel(tileset, zoom, base_x, base_y, grid):
     jobs = []
@@ -99,7 +106,7 @@ def tilequery_at(qlat, qlon):
         r = http_session.get(url, params={
             "access_token": MAPBOX_TOKEN,
             "radius": 1500,
-            "limit": 30,
+            "limit": 50,  # was 30, more room per query point
             "layers": "poi_label,airport_label,natural_label",
         }, timeout=5)
         if r.status_code != 200:
@@ -149,15 +156,23 @@ def get_satellite(lat, lon, zoom):
 def get_pois(lat, lon, zoom):
     try:
         lat, lon, zoom = float(lat), float(lon), int(zoom)
-        n = 2 ** zoom
-        tile_deg = 360 / n
+        x, y = lat_lon_to_tile(lat, lon, zoom)
+
+        # exact geographic bounds of this tile, used to reject overfetched pois
+        lat_top, lon_left = tile_to_lat_lon(x, y, zoom)
+        lat_bot, lon_right = tile_to_lat_lon(x + 1, y + 1, zoom)
+
+        # tile's lat/lon spans (not equal — mercator squishes lat at high latitudes)
+        lon_span = lon_right - lon_left
+        lat_span = lat_top - lat_bot
 
         # 3x3 grid of tilequeries covers a zoom-12 tile
+        # use each axis's real span so points stay inside the tile
         jobs = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
-                qlat = lat + dy * tile_deg / 3
-                qlon = lon + dx * tile_deg / 3
+                qlat = lat + dy * lat_span / 3
+                qlon = lon + dx * lon_span / 3
                 jobs.append(tile_pool.submit(tilequery_at, qlat, qlon))
 
         seen_ids = set()
@@ -181,6 +196,11 @@ def get_pois(lat, lon, zoom):
                 if geom.get("type") != "Point":
                     continue
                 coords = geom.get("coordinates", [0, 0])
+                plon, plat = coords[0], coords[1]
+
+                # drop anything outside the requested tile's bounds
+                if not (lat_bot <= plat <= lat_top and lon_left <= plon <= lon_right):
+                    continue
 
                 layer = props.get("tilequery", {}).get("layer", "")
                 if layer == "airport_label":
@@ -192,8 +212,8 @@ def get_pois(lat, lon, zoom):
 
                 pois.append({
                     "name": name,
-                    "lat": coords[1],
-                    "lon": coords[0],
+                    "lat": plat,
+                    "lon": plon,
                     "category": category,
                     "sizerank": sizerank,
                 })

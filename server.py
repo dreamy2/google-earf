@@ -8,16 +8,15 @@ import numpy as np
 import requests
 from scipy.ndimage import median_filter
 from concurrent.futures import ThreadPoolExecutor
-import mapbox_vector_tile
 
 app = Flask(__name__)
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024
 TERRAIN_RES = 128
-POI_SIZERANK_MAX = 8  # 0=biggest landmarks, 16=tiny shops. 8 = medium+
+POI_SIZERANK_MAX = 8  # 0=biggest, 16=tiny. 8 = landmarks + medium pois
 
-# shared thread pool for parallel mapbox tile fetches
+# shared thread pool for parallel mapbox calls
 tile_pool = ThreadPoolExecutor(max_workers=16)
 
 # shared session reuses tcp connections
@@ -80,26 +79,21 @@ def smooth_heights(heights, passes=3):
         heights = median_filter(heights, size=5)
     return heights
 
-# fetch a mapbox streets v8 vector tile (.mvt) for poi extraction
-def fetch_vector_tile(zoom, x, y):
-    url = f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/{zoom}/{x}/{y}.mvt?access_token={MAPBOX_TOKEN}"
-    r = http_session.get(url, timeout=10)
-    if r.status_code == 404:
-        return {}
-    if r.status_code != 200:
-        raise Exception(f"Mapbox vector tile error {r.status_code}")
-    return mapbox_vector_tile.decode(r.content)
-
-# convert mvt tile-local coords back to lat/lon
-# mapbox-vector-tile lib uses y-up origin so we flip here
-def mvt_to_latlon(px, py, tx, ty, zoom, extent=4096):
-    n = 2.0 ** zoom
-    xtile_frac = tx + (px / extent)
-    ytile_frac = ty + ((extent - py) / extent)
-    lon = (xtile_frac / n) * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ytile_frac / n)))
-    lat = math.degrees(lat_rad)
-    return lat, lon
+# single tilequery call - simple http, no heavy deps
+def tilequery_at(qlat, qlon):
+    url = f"https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/tilequery/{qlon},{qlat}.json"
+    try:
+        r = http_session.get(url, params={
+            "access_token": MAPBOX_TOKEN,
+            "radius": 1500,
+            "limit": 30,
+            "layers": "poi_label,airport_label,natural_label",
+        }, timeout=5)
+        if r.status_code != 200:
+            return []
+        return r.json().get("features", [])
+    except Exception:
+        return []
 
 @app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_terrain(lat, lon, zoom):
@@ -127,79 +121,63 @@ def get_satellite(lat, lon, zoom):
 @app.route('/pois/<lat>/<lon>/<zoom>')
 def get_pois(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
-    x, y = lat_lon_to_tile(lat, lon, zoom)
-    tile_data = fetch_vector_tile(zoom, x, y)
+
+    # tile span in degrees (approx, good enough for grid placement)
+    n = 2 ** zoom
+    tile_deg = 360 / n
+
+    # fire off a 3x3 grid of tilequery requests to cover the whole tile
+    # each query covers ~1.5km radius, 3x3 grid covers a zoom-12 tile well
+    jobs = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            qlat = lat + dy * tile_deg / 3
+            qlon = lon + dx * tile_deg / 3
+            jobs.append(tile_pool.submit(tilequery_at, qlat, qlon))
+
+    # dedupe by feature id
+    seen_ids = set()
     pois = []
+    for job in jobs:
+        for f in job.result():
+            fid = f.get("id")
+            if fid is not None and fid in seen_ids:
+                continue
+            if fid is not None:
+                seen_ids.add(fid)
 
-    # poi_label layer: medium to large general pois (skip restaurants/shops)
-    poi_layer = tile_data.get('poi_label', {})
-    for feature in poi_layer.get('features', []):
-        props = feature.get('properties', {})
-        sizerank = props.get('sizerank', 16)
-        if sizerank > POI_SIZERANK_MAX:
-            continue
-        name = props.get('name', '') or props.get('name_en', '')
-        if not name:
-            continue
-        geom = feature.get('geometry', {})
-        if geom.get('type') != 'Point':
-            continue
-        coords = geom.get('coordinates', [0, 0])
-        plat, plon = mvt_to_latlon(coords[0], coords[1], x, y, zoom)
-        pois.append({
-            "name": name,
-            "lat": plat,
-            "lon": plon,
-            "category": props.get('class', 'general'),
-            "sizerank": sizerank,
-        })
+            props = f.get("properties", {})
+            sizerank = props.get("sizerank", 16)
+            if sizerank > POI_SIZERANK_MAX:
+                continue
 
-    # airport_label layer: every airport is important for a flight sim
-    airport_layer = tile_data.get('airport_label', {})
-    for feature in airport_layer.get('features', []):
-        props = feature.get('properties', {})
-        name = props.get('name', '') or props.get('ref', '') or props.get('name_en', '')
-        if not name:
-            continue
-        geom = feature.get('geometry', {})
-        if geom.get('type') != 'Point':
-            continue
-        coords = geom.get('coordinates', [0, 0])
-        plat, plon = mvt_to_latlon(coords[0], coords[1], x, y, zoom)
-        pois.append({
-            "name": name,
-            "lat": plat,
-            "lon": plon,
-            "category": "airport",
-            "sizerank": props.get('sizerank', 0),
-        })
+            name = props.get("name") or props.get("name_en") or props.get("ref")
+            if not name:
+                continue
 
-    # natural_label layer: mountains, lakes, rivers, major parks
-    natural_layer = tile_data.get('natural_label', {})
-    for feature in natural_layer.get('features', []):
-        props = feature.get('properties', {})
-        sizerank = props.get('sizerank', 16)
-        if sizerank > POI_SIZERANK_MAX:
-            continue
-        name = props.get('name', '') or props.get('name_en', '')
-        if not name:
-            continue
-        geom = feature.get('geometry', {})
-        if geom.get('type') != 'Point':
-            continue
-        coords = geom.get('coordinates', [0, 0])
-        plat, plon = mvt_to_latlon(coords[0], coords[1], x, y, zoom)
-        pois.append({
-            "name": name,
-            "lat": plat,
-            "lon": plon,
-            "category": "natural",
-            "sizerank": sizerank,
-        })
+            geom = f.get("geometry", {})
+            if geom.get("type") != "Point":
+                continue
+            coords = geom.get("coordinates", [0, 0])
 
-    # sort by importance (lowest sizerank first = biggest/most important)
+            # category comes from either the class field or the source layer
+            layer = props.get("tilequery", {}).get("layer", "")
+            if layer == "airport_label":
+                category = "airport"
+            elif layer == "natural_label":
+                category = "natural"
+            else:
+                category = props.get("class", "general")
+
+            pois.append({
+                "name": name,
+                "lat": coords[1],
+                "lon": coords[0],
+                "category": category,
+                "sizerank": sizerank,
+            })
+
     pois.sort(key=lambda p: p["sizerank"])
-
     return jsonify({"pois": pois})
 
 if __name__ == '__main__':

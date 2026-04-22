@@ -1,5 +1,4 @@
 import os
-import base64
 import math
 import io
 
@@ -14,7 +13,7 @@ app = Flask(__name__)
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 SATELLITE_RES = 1024
 TERRAIN_RES = 128
-NORMAL_STRENGTH = 3.0  # higher = more dramatic normals
+NORMAL_STRENGTH = 3.0  # higher = more dramatic slope lighting
 
 def lat_lon_to_tile(lat, lon, zoom):
     lat_r = math.radians(lat)
@@ -31,6 +30,7 @@ def fetch_tile(tileset, z, x, y):
     return Image.open(io.BytesIO(r.content))
 
 def fetch_and_stitch_satellite(terrain_zoom, terrain_x, terrain_y):
+    # grabs higher zoom tiles over the same area for real extra detail
     zoom_offset = int(math.log2(SATELLITE_RES // 256))
     grid = 2 ** zoom_offset
     sat_zoom = terrain_zoom + zoom_offset
@@ -66,22 +66,24 @@ def fetch_and_stitch_terrain(zoom, x, y):
     return stitched
 
 def smooth_heights(heights, passes=3):
+    # median filter kills building/noise spikes without flattening real hills
     for _ in range(passes):
         heights = median_filter(heights, size=5)
     return heights
 
 def generate_normal_map(heights, size):
-    # sobel gradients for slope
+    # sobel gradients = slope in x and y
     gx = sobel(heights, axis=1) * NORMAL_STRENGTH
     gy = sobel(heights, axis=0) * NORMAL_STRENGTH
 
+    # build unit normal vectors from slopes
     nz = np.ones_like(heights)
     length = np.sqrt(gx*gx + gy*gy + nz*nz)
     nx = -gx / length
     ny = -gy / length
     nz = nz / length
 
-    # pack into rgba 0-255
+    # pack normal vectors into rgba 0-255 (tangent space convention)
     rgba = np.stack([
         ((nx * 0.5) + 0.5) * 255,
         ((ny * 0.5) + 0.5) * 255,
@@ -92,18 +94,6 @@ def generate_normal_map(heights, size):
     img = Image.fromarray(rgba, mode="RGBA").resize((size, size), Image.BILINEAR)
     return [v for px in img.getdata() for v in px]
 
-def detect_water_mask(sat_img):
-    # water is where blue dominates over red/green significantly
-    # simple threshold but works great for rivers/lakes/ocean
-    arr = np.array(sat_img.convert("RGB"), dtype=np.int16)
-    R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
-    # blue should be higher than red and green, and overall darker/cooler
-    is_water = (B > R + 5) & (B > G - 5) & (R < 130) & (G < 150)
-    mask = (is_water.astype(np.uint8) * 255)
-    # downsample to a low-res coverage grid (how much of this region is water)
-    img = Image.fromarray(mask).resize((32, 32), Image.BILINEAR)
-    return np.array(img).flatten().tolist()
-
 @app.route('/terrain/<lat>/<lon>/<zoom>')
 def get_terrain(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
@@ -111,9 +101,10 @@ def get_terrain(lat, lon, zoom):
     heights = fetch_and_stitch_terrain(zoom, x, y)
     heights = smooth_heights(heights, passes=3)
 
-    # normal map at satellite resolution so it matches the color map
+    # generate normal map at full satellite res so it aligns with the color map
     normal_pixels = generate_normal_map(heights, SATELLITE_RES)
 
+    # downsample heights for mesh vertices
     h_img = Image.fromarray(heights)
     h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
     heights = np.array(h_img)
@@ -132,19 +123,9 @@ def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_and_stitch_satellite(zoom, x, y)
-    img = img.resize((SATELLITE_RES, SATELLITE_RES))
-
-    # detect water coverage before converting to rgba
-    water_mask = detect_water_mask(img)
-
-    img = img.convert("RGBA")
+    img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
     flat = [v for px in img.getdata() for v in px]
-    return jsonify({
-        "pixels": flat,
-        "size": SATELLITE_RES,
-        "water_mask": water_mask,
-        "water_mask_size": 32,
-    })
+    return jsonify({"pixels": flat, "size": SATELLITE_RES})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

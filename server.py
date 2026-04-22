@@ -71,29 +71,26 @@ def smooth_heights(heights, passes=3):
     return heights
 
 def generate_normal_map(heights, size):
-    # sobel gradients give slope in x/y directions
-    # then convert slope to a normal vector in tangent space
+    # sobel gradients for slope
     gx = sobel(heights, axis=1) * NORMAL_STRENGTH
     gy = sobel(heights, axis=0) * NORMAL_STRENGTH
 
-    # build normal vectors and normalize
     nz = np.ones_like(heights)
     length = np.sqrt(gx*gx + gy*gy + nz*nz)
     nx = -gx / length
     ny = -gy / length
     nz = nz / length
 
-    # pack into rgb 0-255 (standard tangent-space normal map format)
-    rgb = np.stack([
+    # pack into rgba 0-255
+    rgba = np.stack([
         ((nx * 0.5) + 0.5) * 255,
         ((ny * 0.5) + 0.5) * 255,
         ((nz * 0.5) + 0.5) * 255,
+        np.full_like(nz, 255),
     ], axis=-1).astype(np.uint8)
 
-    img = Image.fromarray(rgb).resize((size, size), Image.BILINEAR)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+    img = Image.fromarray(rgba, mode="RGBA").resize((size, size), Image.BILINEAR)
+    return [v for px in img.getdata() for v in px]
 
 def detect_water_mask(sat_img):
     # water is where blue dominates over red/green significantly
@@ -114,10 +111,9 @@ def get_terrain(lat, lon, zoom):
     heights = fetch_and_stitch_terrain(zoom, x, y)
     heights = smooth_heights(heights, passes=3)
 
-    # generate normal map at satellite resolution for best visual match
-    normal_b64 = generate_normal_map(heights, SATELLITE_RES)
+    # normal map at satellite resolution so it matches the color map
+    normal_pixels = generate_normal_map(heights, SATELLITE_RES)
 
-    # resize heights to target terrain res for mesh use
     h_img = Image.fromarray(heights)
     h_img = h_img.resize((TERRAIN_RES, TERRAIN_RES), Image.BILINEAR)
     heights = np.array(h_img)
@@ -127,7 +123,8 @@ def get_terrain(lat, lon, zoom):
         "size": TERRAIN_RES,
         "min_height": float(heights.min()),
         "max_height": float(heights.max()),
-        "normal_map_b64": normal_b64,
+        "normal_pixels": normal_pixels,
+        "normal_size": SATELLITE_RES,
     })
 
 @app.route('/satellite/<lat>/<lon>/<zoom>')

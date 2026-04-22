@@ -10,6 +10,8 @@ import requests
 
 app = Flask(__name__)
 
+SATELLITE_RES = 512
+
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
 def lat_lon_to_tile(lat, lon, zoom):
@@ -50,10 +52,9 @@ def get_satellite(lat, lon, zoom):
     lat, lon, zoom = float(lat), float(lon), int(zoom)
     x, y = lat_lon_to_tile(lat, lon, zoom)
     img = fetch_tile("mapbox.satellite", zoom, x, y)
-    img = img.resize((256, 256)).convert("RGBA")
-    # flat list of r,g,b,a integers 0-255
+    img = img.resize((SATELLITE_RES, SATELLITE_RES)).convert("RGBA")
     flat = [v for px in img.getdata() for v in px]
-    return jsonify({"pixels": flat, "size": 256})
+    return jsonify({"pixels": flat, "size": SATELLITE_RES})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))

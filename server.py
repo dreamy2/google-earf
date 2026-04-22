@@ -10,7 +10,7 @@ import requests
 
 app = Flask(__name__)
 
-SATELLITE_RES = 1024
+SATELLITE_RES = 512
 
 MAPBOX_TOKEN = os.environ.get("MAPBOX_TOKEN")
 
